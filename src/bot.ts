@@ -18,6 +18,7 @@ import {
     MessageFlags} from 'discord.js';
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import fs from 'fs';
 import playdl from 'play-dl';
 // import ytdl from '@distube/ytdl-core';
 
@@ -45,13 +46,20 @@ if (process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET) {
 }
 
 // Try to authorise YouTube access
-if (process.env.YOUTUBE_COOKIES) {
-    playdl.setToken({
-        youtube: {
-            cookie: process.env.YOUTUBE_COOKIES
-        }
-    });
-    console.log('YouTube cookies loaded.');
+let youtubeCookies: any = null;
+try {
+    if (fs.existsSync('/app/cookies.json')) {
+        const rawCookies = fs.readFileSync('/app/cookies.json', 'utf8');
+        youtubeCookies = JSON.parse(rawCookies);
+        playdl.setToken({
+            youtube: {
+                cookie: youtubeCookies
+            }
+        });
+        console.log('YouTube cookies loaded from /app/cookies.json');
+    }
+} catch (err) {
+    console.warn('Failed to load YouTube cookies:', err);
 }
 
 interface TrackMetadata {
@@ -424,10 +432,14 @@ async function createResource(url: string) {
         try {
             // Get the raw audio URL using yt-dlp
             let command = `yt-dlp -f bestaudio -g`;
-            if (process.env.YOUTUBE_COOKIES) {
-                const escapedCookies = process.env.YOUTUBE_COOKIES.replace(/"/g, '\\"');
+            
+            if (youtubeCookies && Array.isArray(youtubeCookies)) {
+                // Convert JSON cookies to header string for yt-dlp
+                const cookieHeader = youtubeCookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
+                const escapedCookies = cookieHeader.replace(/"/g, '\\"');
                 command += ` --add-header "Cookie:${escapedCookies}"`;
             }
+            
             command += ` --js-runtimes node "${url}"`;
 
             const { stdout } = await execAsync(command);
