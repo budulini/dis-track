@@ -447,34 +447,28 @@ async function createResource(url: string) {
 
     // Switch to play-dl for YouTube as well due to ytdl-core issues
     console.log(`[DEBUG] Streaming URL: ${url}`);
+    
+    console.log(`[INFO] Using yt-dlp for ${url}`);
     try {
-        const stream = await playdl.stream(url);
-        return createAudioResource(stream.stream, {
-            inputType: stream.type === 'opus' ? StreamType.Opus : StreamType.Arbitrary
-        });
-    } catch (err) {
-        console.error(`[ERROR] playdl.stream failed for ${url}:`, err);
+        // Get the raw audio URL using yt-dlp
+        let command = `yt-dlp -f bestaudio -g`;
         
-        console.log(`[INFO] Falling back to yt-dlp for ${url}`);
-        try {
-            // Get the raw audio URL using yt-dlp
-            let command = `yt-dlp -f bestaudio -g`;
-            
-            if (fs.existsSync('/app/cookies.txt')) {
-                command += ` --cookies "/app/cookies.txt"`;
-            }
-            
-            command += ` --js-runtimes node "${url}"`;
-
-            const { stdout } = await execAsync(command);
-            const audioUrl = stdout.trim();
-            if (!audioUrl) throw new Error('yt-dlp returned empty URL');
-            
-            return createAudioResource(audioUrl, { inputType: StreamType.Arbitrary });
-        } catch (ytDlpErr) {
-            console.error(`[ERROR] yt-dlp failed for ${url}:`, ytDlpErr);
-            throw new Error('ALL_FALLBACKS_FAILED');
+        if (fs.existsSync('/app/cookies.txt')) {
+            command += ` --cookies "/app/cookies.txt"`;
         }
+        
+        // Add remote components for challenge solving
+        command += ` --remote-components ejs:github`;
+        command += ` --js-runtimes node "${url}"`;
+
+        const { stdout } = await execAsync(command);
+        const audioUrl = stdout.trim();
+        if (!audioUrl) throw new Error('yt-dlp returned empty URL');
+        
+        return createAudioResource(audioUrl, { inputType: StreamType.Arbitrary });
+    } catch (ytDlpErr) {
+        console.error(`[ERROR] yt-dlp failed for ${url}:`, ytDlpErr);
+        throw new Error('ALL_FALLBACKS_FAILED');
     }
 }
 
