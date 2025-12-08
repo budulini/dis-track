@@ -266,5 +266,5 @@ app.post<{ guildId: string }>('/api/queue/:guildId', async (req, res) => {
 app.use('/', swaggerUi.serve, swaggerUi.setup(swaggerDocument));
 
 app.listen(PORT, () => {
-    console.log(`🚀 API Server running on port ${PORT}`);
+    console.log(`API Server running on port ${PORT}`);
 });

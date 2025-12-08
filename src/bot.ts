@@ -14,9 +14,14 @@ import {
     EmbedBuilder,
     ButtonBuilder,
     ButtonStyle,
-    ActionRowBuilder} from 'discord.js';
+    ActionRowBuilder,
+    MessageFlags} from 'discord.js';
+import { exec } from 'child_process';
+import { promisify } from 'util';
 import playdl from 'play-dl';
-import ytdl from '@distube/ytdl-core';
+// import ytdl from '@distube/ytdl-core';
+
+const execAsync = promisify(exec);
 
 // Optional debug flag to log skipped tracks
 const LOG_SKIPPED_TRACKS = process.env.LOG_SKIPPED_TRACKS === 'true';
@@ -31,12 +36,12 @@ if (process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET) {
             market: 'US'
         }
     });
-    console.log(`🎧  Spotify credentials loaded – ${process.env.SPOTIFY_REFRESH_TOKEN ? 'full track/playlist support' : 'client‑credentials only (public tracks)'}.`);
+    console.log(`Spotify credentials loaded – ${process.env.SPOTIFY_REFRESH_TOKEN ? 'full track/playlist support' : 'client‑credentials only (public tracks)'}.`);
     if (!process.env.SPOTIFY_REFRESH_TOKEN) {
-        console.warn('⚠️  SPOTIFY_REFRESH_TOKEN is not set. Some private/large Spotify endpoints may fail. See README for token generation.');
+        console.warn('SPOTIFY_REFRESH_TOKEN is not set. Some private/large Spotify endpoints may fail. See README for token generation.');
     }
 } else {
-    console.warn('⚠️  Spotify credentials missing (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). Spotify links will fail.');
+    console.warn('Spotify credentials missing (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). Spotify links will fail.');
 }
 
 interface TrackMetadata {
@@ -208,7 +213,7 @@ export async function processPlayRequest(
     if (player.state.status === AudioPlayerStatus.Idle || !existingConn) {
         let connection = existingConn;
         if (!connection) {
-            console.log(`🔊 Creating new voice connection for ${guildId}`);
+            console.log(`Creating new voice connection for ${guildId}`);
             connection = joinVoiceChannel({
                 channelId: voiceChannel.id,
                 guildId: guildId,
@@ -386,18 +391,42 @@ async function createResource(url: string) {
         } catch {/* fall through */}
         throw new Error('Direct Spotify streaming is not supported and no fallback was found.');
     }
-    if (/youtu\.?be/.test(url)) {
-        const ytStream = ytdl(url, {
-            filter: 'audioonly',
-            quality: 'highestaudio',
-            highWaterMark: 1 << 25
-        });
-        return createAudioResource(ytStream, { inputType: StreamType.Arbitrary });
-    } else {
-        const stream = await playdl.stream(url, { quality: 2 });
+
+    // Validate URL before streaming
+    const validation = await playdl.validate(url);
+    if (!validation) {
+        // Not a URL, try searching
+        console.log(`[INFO] '${url}' is not a valid URL, searching...`);
+        const searchResult = await playdl.search(url, { limit: 1 });
+        if (searchResult.length > 0) {
+             return await createResource(searchResult[0].url);
+        } else {
+             throw new Error('NO_RESULTS_FOUND');
+        }
+    }
+
+    // Switch to play-dl for YouTube as well due to ytdl-core issues
+    console.log(`[DEBUG] Streaming URL: ${url}`);
+    try {
+        const stream = await playdl.stream(url);
         return createAudioResource(stream.stream, {
             inputType: stream.type === 'opus' ? StreamType.Opus : StreamType.Arbitrary
         });
+    } catch (err) {
+        console.error(`[ERROR] playdl.stream failed for ${url}:`, err);
+        
+        console.log(`[INFO] Falling back to yt-dlp for ${url}`);
+        try {
+            // Get the raw audio URL using yt-dlp
+            const { stdout } = await execAsync(`yt-dlp -f bestaudio -g "${url}"`);
+            const audioUrl = stdout.trim();
+            if (!audioUrl) throw new Error('yt-dlp returned empty URL');
+            
+            return createAudioResource(audioUrl, { inputType: StreamType.Arbitrary });
+        } catch (ytDlpErr) {
+            console.error(`[ERROR] yt-dlp failed for ${url}:`, ytDlpErr);
+            throw new Error('ALL_FALLBACKS_FAILED');
+        }
     }
 }
 
@@ -407,7 +436,7 @@ async function safeCreateResource(url: string) {
     } catch (error: any) {
         // Check if it's a 404 error
         if (error.message && error.message.includes('404')) {
-            console.log(`⚠️ Resource not found (404): ${url}`);
+            console.log(`Resource not found (404): ${url}`);
             throw new Error('RESOURCE_NOT_FOUND');
         }
         throw error; // Re-throw other errors
@@ -456,16 +485,16 @@ async function playFromQueue(connection: import('@discordjs/voice').VoiceConnect
             return; // success
         } catch (err: any) {
             if (err.message === 'RESOURCE_NOT_FOUND') {
-                console.log(`⤼ Track unavailable (404), skipping: ${nextUrl}`);
+                console.log(`Track unavailable (404), skipping: ${nextUrl}`);
                 retryCount = 0; // Reset retry count for new URL
             } else {
-                console.error('⤼ Failed to play track, skipping:', nextUrl, err);
+                console.error('Failed to play track, skipping:', nextUrl, err);
                 if (LOG_SKIPPED_TRACKS) {
                     console.log(`Skipped track due to error: ${nextUrl}`);
                 }
                 retryCount++;
                 if (retryCount >= maxRetries) {
-                    console.error(`❌ Reached ${maxRetries} consecutive failures. Continuing queue.`);
+                    console.error(`Reached ${maxRetries} consecutive failures. Continuing queue.`);
                     retryCount = 0;
                 }
             }
@@ -474,7 +503,7 @@ async function playFromQueue(connection: import('@discordjs/voice').VoiceConnect
 
     // No playable tracks remain
     if (retryCount > 0) {
-        console.error(`❌ Failed to play any tracks after scanning the queue.`);
+        console.error(`Failed to play any tracks after scanning the queue.`);
     }
 
     updateEmbedToStopped(guildId);
@@ -534,7 +563,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 });
 
 client.once(Events.ClientReady, c => {
-    console.log(`✅  Logged in as ${c.user.tag}`);
+    console.log(`Logged in as ${c.user.tag}`);
 });
 
 
@@ -739,7 +768,7 @@ function checkInactivity(connection: import('@discordjs/voice').VoiceConnection)
     }
 
     const timeout = setTimeout(() => {
-        console.log(`🔌 Disconnecting from ${guildId} due to inactivity (3 minutes)`);
+        console.log(`Disconnecting from ${guildId} due to inactivity (3 minutes)`);
         connection.destroy();
         queues.set(guildId, []);
         disconnectTimeouts.delete(guildId);
@@ -885,12 +914,12 @@ client.on(Events.InteractionCreate, async interaction => {
         const player = getPlayer(gid);
         if (player.state.status === AudioPlayerStatus.Playing) {
             player.pause();
-            await interaction.reply({ content: '⏸️ Paused.', ephemeral: true });
+            await interaction.reply({ content: '⏸️ Paused.', flags: MessageFlags.Ephemeral });
         } else if (player.state.status === AudioPlayerStatus.Paused) {
             player.unpause();
-            await interaction.reply({ content: '▶️ Resumed.', ephemeral: true });
+            await interaction.reply({ content: '▶️ Resumed.', flags: MessageFlags.Ephemeral });
         } else {
-            await interaction.reply({ content: '⚠️ Nothing is currently playing.', ephemeral: true });
+            await interaction.reply({ content: '⚠️ Nothing is currently playing.', flags: MessageFlags.Ephemeral });
         }
     }
     else if (interaction.customId === 'music_skip') {
@@ -899,9 +928,9 @@ client.on(Events.InteractionCreate, async interaction => {
         const player = getPlayer(gid);
         if (player.state.status !== AudioPlayerStatus.Idle) {
             player.stop();
-            await interaction.reply({ content: '⏭️ Skipped.', ephemeral: true });
+            await interaction.reply({ content: '⏭️ Skipped.', flags: MessageFlags.Ephemeral });
         } else {
-            await interaction.reply({ content: '⚠️ Nothing to skip.', ephemeral: true });
+            await interaction.reply({ content: '⚠️ Nothing to skip.', flags: MessageFlags.Ephemeral });
         }
     }
 
@@ -916,9 +945,9 @@ client.on(Events.InteractionCreate, async interaction => {
             player.stop();
             connection.destroy();
             updateEmbedToStopped(guildId);
-            await interaction.reply({ content: '⏹️ Stopped playback and cleared queue.', ephemeral: true });
+            await interaction.reply({ content: '⏹️ Stopped playback and cleared queue.', flags: MessageFlags.Ephemeral });
         } else {
-            await interaction.reply({ content: '⚠️ I\'m not in a voice channel.', ephemeral: true });
+            await interaction.reply({ content: '⚠️ I\'m not in a voice channel.', flags: MessageFlags.Ephemeral });
         }
     }
 });
@@ -982,7 +1011,7 @@ client.on(Events.InteractionCreate, async interaction  => {
             queues.set(gid, []);
             await interaction.reply('🗑️  Cleared the queue.');
         } else {
-            await interaction.reply({ content: '⚠️  I can\'t determine the guild.', ephemeral: true });
+            await interaction.reply({ content: '⚠️  I can\'t determine the guild.', flags: MessageFlags.Ephemeral });
         }
     }
     else if (interaction.commandName === 'pause') {
@@ -993,7 +1022,7 @@ client.on(Events.InteractionCreate, async interaction  => {
             player.pause();
             await interaction.reply('⏸️ Paused.');
         } else {
-            await interaction.reply({ content: '⚠️ Nothing is currently playing.', ephemeral: true });
+            await interaction.reply({ content: '⚠️ Nothing is currently playing.', flags: MessageFlags.Ephemeral });
         }
     }
     else if (interaction.commandName === 'resume') {
@@ -1004,7 +1033,7 @@ client.on(Events.InteractionCreate, async interaction  => {
             player.unpause();
             await interaction.reply('▶️ Resumed.');
         } else {
-            await interaction.reply({ content: '⚠️ Nothing is paused.', ephemeral: true });
+            await interaction.reply({ content: '⚠️ Nothing is paused.', flags: MessageFlags.Ephemeral });
         }
     }
     else if (interaction.commandName === 'skip') {
@@ -1015,7 +1044,7 @@ client.on(Events.InteractionCreate, async interaction  => {
             player.stop();
             await interaction.reply('⏭️ Skipped.');
         } else {
-            await interaction.reply({ content: '⚠️ Nothing to skip.', ephemeral: true });
+            await interaction.reply({ content: '⚠️ Nothing to skip.', flags: MessageFlags.Ephemeral });
         }
     }
     else if (interaction.commandName === 'stop') {
@@ -1033,14 +1062,14 @@ client.on(Events.InteractionCreate, async interaction  => {
                 ? '⏹️ Stopped playback and cleared queue.'
                 : '👋 Left the voice channel.');
         } else {
-            await interaction.reply({ content: '⚠️ I\'m not in a voice channel.', ephemeral: true });
+            await interaction.reply({ content: '⚠️ I\'m not in a voice channel.', flags: MessageFlags.Ephemeral });
         }
     }
     else if (interaction.commandName === 'np') {
         // Get guild ID
         const guildId = interaction.guild?.id;
         if (!guildId) {
-            await interaction.reply({ content: '⚠️ Cannot determine the guild.', ephemeral: true });
+            await interaction.reply({ content: '⚠️ Cannot determine the guild.', flags: MessageFlags.Ephemeral });
             return;
         }
 
