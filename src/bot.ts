@@ -51,12 +51,22 @@ try {
     if (fs.existsSync('/app/cookies.json')) {
         const rawCookies = fs.readFileSync('/app/cookies.json', 'utf8');
         youtubeCookies = JSON.parse(rawCookies);
-        playdl.setToken({
-            youtube: {
-                cookie: youtubeCookies
-            }
-        });
-        console.log('YouTube cookies loaded from /app/cookies.json');
+        
+        let cookieForPlayDl = '';
+        if (Array.isArray(youtubeCookies)) {
+            cookieForPlayDl = youtubeCookies.map((c: any) => `${c.name}=${c.value}`).join('; ');
+        } else if (typeof youtubeCookies === 'string') {
+             cookieForPlayDl = youtubeCookies;
+        }
+
+        if (cookieForPlayDl) {
+            playdl.setToken({
+                youtube: {
+                    cookie: cookieForPlayDl
+                }
+            });
+            console.log('YouTube cookies loaded from /app/cookies.json');
+        }
     }
 } catch (err) {
     console.warn('Failed to load YouTube cookies:', err);
