@@ -44,6 +44,16 @@ if (process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET) {
     console.warn('Spotify credentials missing (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). Spotify links will fail.');
 }
 
+// Try to authorise YouTube access
+if (process.env.YOUTUBE_COOKIES) {
+    playdl.setToken({
+        youtube: {
+            cookie: process.env.YOUTUBE_COOKIES
+        }
+    });
+    console.log('YouTube cookies loaded.');
+}
+
 interface TrackMetadata {
     url: string;
     title: string;
@@ -147,11 +157,7 @@ function getPlayer(guildId: string): import('@discordjs/voice').AudioPlayer {
     return player;
 }
 
-/**
- * Core logic for the “play” request.
- * Handles: resolving the URL, queueing, connecting, and optionally starting playback.
- * Re‑used by both the text‑prefix (`!play`) and slash (`/play`) commands so the behaviour is identical.
- */
+
 export async function processPlayRequest(
     url: string,
     voiceChannel: Exclude<import('discord.js').GuildMember['voice']['channel'], null>,
@@ -159,11 +165,11 @@ export async function processPlayRequest(
     respond: Responder,
     requester: string
 ): Promise<void> {
-    // ---------------- main logic ----------------
+
     const player = getPlayer(guildId);
     const first = await resolveFirstTrack(url);
 
-    // ── If the first track itself is unplayable … ──────────────────
+    // if fisrt is invalid
     if (!first) {
         const playable = await resolveTracks(url);
         if (playable.length === 0) {
@@ -176,7 +182,7 @@ export async function processPlayRequest(
         if (!q) { q = []; queues.set(guildId, q); }
         q.push(...playable.map(u => ({ url: u, requester })));
 
-        // ensure / reuse a voice connection then start playback
+        // ensure voice connection then start playback
         let connection = (player as any).subscribers.find((sub: any) => sub.connection?.joinConfig.guildId === guildId)?.connection;
         if (!connection) {
             connection = joinVoiceChannel({
@@ -196,11 +202,10 @@ export async function processPlayRequest(
         return;
     }
 
-    // ── We have a playable "first" track ───────────────────────────
+
     let q = queues.get(guildId);
     if (!q) { q = []; queues.set(guildId, q); }
 
-    // enqueue remainder of playlist/album in background
     (async () => {
         const rest = await resolveTracks(url);
         if (rest.length && rest[0] === first) rest.shift();
@@ -231,7 +236,7 @@ export async function processPlayRequest(
             artist: 'Loading...',
             duration: 'Unknown',
             requester,
-            thumbnail: 'https://i.imgur.com/QMnXrF6.png'
+            thumbnail: 'https://cdn.discordapp.com/icons/1438438764115394593/13faca0e47f8d2f43e1893f95c1a4c3f.webp?size=1024'
         };
         currentTracks.set(guildId, metadata);
 
@@ -418,7 +423,14 @@ async function createResource(url: string) {
         console.log(`[INFO] Falling back to yt-dlp for ${url}`);
         try {
             // Get the raw audio URL using yt-dlp
-            const { stdout } = await execAsync(`yt-dlp -f bestaudio -g "${url}"`);
+            let command = `yt-dlp -f bestaudio -g`;
+            if (process.env.YOUTUBE_COOKIES) {
+                const escapedCookies = process.env.YOUTUBE_COOKIES.replace(/"/g, '\\"');
+                command += ` --add-header "Cookie:${escapedCookies}"`;
+            }
+            command += ` --js-runtimes node "${url}"`;
+
+            const { stdout } = await execAsync(command);
             const audioUrl = stdout.trim();
             if (!audioUrl) throw new Error('yt-dlp returned empty URL');
             
