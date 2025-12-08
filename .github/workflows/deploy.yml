@@ -1,4 +1,4 @@
-name: Deploy to Ubuntu
+name: Deploy to oracle
 
 on:
   push:
