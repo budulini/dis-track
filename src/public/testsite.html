@@ -60,7 +60,7 @@
         </div>
         <div>
             <label for="apiUrl">API URL:</label>
-            <input type="text" id="apiUrl" value="http://localhost:3000" placeholder="API URL">
+            <input type="text" id="apiUrl" value="" placeholder="API URL">
             <button onclick="saveApiUrl()">Save</button>
         </div>
     </div>
@@ -126,7 +126,7 @@
     // Initialize form values from localStorage
     window.onload = function() {
         document.getElementById('guildId').value = localStorage.getItem(GUILD_ID_KEY) || '';
-        document.getElementById('apiUrl').value = localStorage.getItem(API_URL_KEY) || 'http://localhost:3000';
+        document.getElementById('apiUrl').value = localStorage.getItem(API_URL_KEY) || window.location.origin;
     };
 
     // Save settings to localStorage
@@ -153,7 +153,7 @@
     }
 
     function getApiUrl() {
-        return localStorage.getItem(API_URL_KEY) || 'http://localhost:3000';
+        return localStorage.getItem(API_URL_KEY) || window.location.origin;
     }
 
     // API Calls

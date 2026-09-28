@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+node_modules
+dist
+.env
+.env.*
+cookies.json
+cookies.txt
+spotify-data
+npm-debug.log*

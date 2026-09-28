@@ -36,6 +36,10 @@ const commands = [
         .setDescription('Clear the current playback queue'),
 
     new SlashCommandBuilder()
+        .setName('shuffle')
+        .setDescription('Shuffle upcoming tracks without interrupting playback'),
+
+    new SlashCommandBuilder()
         .setName('queue')
         .setDescription('Show the current playback queue'),
 

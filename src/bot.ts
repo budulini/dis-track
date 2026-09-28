@@ -16,33 +16,37 @@ import {
     ButtonStyle,
     ActionRowBuilder,
     MessageFlags} from 'discord.js';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
+import { randomUUID } from 'node:crypto';
+import { shuffleInPlace, pageItems } from './queue';
 import playdl from 'play-dl';
+import { publicSpotifyTrack, spotifyTracks, SpotifyError } from './spotify';
 // import ytdl from '@distube/ytdl-core';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
+
+async function runYtDlp(args: string[], url: string): Promise<string> {
+    const options = ['--no-warnings', '--remote-components', 'ejs:github', '--js-runtimes', 'node'];
+    if (fs.existsSync('/app/cookies.txt')) options.push('--cookies', '/app/cookies.txt');
+    const { stdout } = await execFileAsync('yt-dlp', [...options, ...args, '--', url], {
+        timeout: 60_000,
+        maxBuffer: 8 * 1024 * 1024
+    });
+    return stdout.trim();
+}
 
 // Optional debug flag to log skipped tracks
 const LOG_SKIPPED_TRACKS = process.env.LOG_SKIPPED_TRACKS === 'true';
 
-// Try to authorise Spotify access for play‑dl
-if (process.env.SPOTIFY_CLIENT_ID && process.env.SPOTIFY_CLIENT_SECRET) {
-    playdl.setToken({
-        spotify: {
-            client_id: process.env.SPOTIFY_CLIENT_ID,
-            client_secret: process.env.SPOTIFY_CLIENT_SECRET,
-            refresh_token: process.env.SPOTIFY_REFRESH_TOKEN as any,
-            market: 'US'
-        }
-    });
-    console.log(`Spotify credentials loaded – ${process.env.SPOTIFY_REFRESH_TOKEN ? 'full track/playlist support' : 'client‑credentials only (public tracks)'}.`);
-    if (!process.env.SPOTIFY_REFRESH_TOKEN) {
-        console.warn('SPOTIFY_REFRESH_TOKEN is not set. Some private/large Spotify endpoints may fail. See README for token generation.');
-    }
-} else {
-    console.warn('Spotify credentials missing (SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET). Spotify links will fail.');
+async function spotifyInfo(url: string): Promise<any> {
+    return publicSpotifyTrack(url);
+}
+
+async function searchYouTube(query: string): Promise<{ url: string }[]> {
+    const result = await runYtDlp(['--flat-playlist', '--print', 'webpage_url'], `ytsearch1:${query}`);
+    return result.split('\n').filter(Boolean).map(url => ({ url }));
 }
 
 // Try to authorise YouTube access
@@ -99,6 +103,7 @@ interface TrackMetadata {
 }
 
 interface QueueItem {
+    id?: string;
     url: string;
     requester?: string;
 }
@@ -130,7 +135,7 @@ async function getCachedTrackInfo(url: string): Promise<CachedTrackInfo> {
     }
     try {
         if (/open\.spotify\.com/.test(url)) {
-            const sp: any = await playdl.spotify(url);
+            const sp: any = await spotifyInfo(url);
             const info = {
                 title: sp.name as string || 'Unknown',
                 author: Array.isArray(sp.artists)
@@ -142,12 +147,12 @@ async function getCachedTrackInfo(url: string): Promise<CachedTrackInfo> {
             trackInfoCache.set(url, info);
             return info;
         } else {
-            const vid = await playdl.video_basic_info(url);
+            const vid = JSON.parse(await runYtDlp(['--dump-single-json', '--no-playlist', '--skip-download'], url));
             const info = {
-                title: vid.video_details.title || 'Unknown',
-                author: vid.video_details.channel?.name || 'Unknown',
-                thumbnail: vid.video_details.thumbnails[0]?.url,
-                duration: vid.video_details.durationRaw
+                title: vid.title || 'Unknown',
+                author: vid.channel || vid.uploader || 'Unknown',
+                thumbnail: vid.thumbnail,
+                duration: vid.duration_string
             };
             trackInfoCache.set(url, info);
             return info;
@@ -166,7 +171,13 @@ function getPlayer(guildId: string): import('@discordjs/voice').AudioPlayer {
         player = createAudioPlayer();
         players.set(guildId, player);
 
+        player.on('error', error => {
+            console.error('Audio playback failed:', error.message);
+            player?.stop();
+        });
+
         player.on(AudioPlayerStatus.Idle, () => {
+            currentTracks.delete(guildId);
             const connection = getVoiceConnections().get(guildId);
             if (connection) {
                 void playFromQueue(connection);
@@ -200,9 +211,35 @@ export async function processPlayRequest(
     respond: Responder,
     requester: string
 ): Promise<void> {
-
+    // YouTube's radio mix is dynamically generated, not a normal playlist.
+    // Play the selected video without resolving the endless RD... mix.
+    try {
+        const link = new URL(url);
+        if (['youtube.com', 'www.youtube.com', 'music.youtube.com', 'm.youtube.com'].includes(link.hostname)
+            && link.searchParams.has('v') && link.searchParams.get('list')?.startsWith('RD')) {
+            url = `https://www.youtube.com/watch?v=${encodeURIComponent(link.searchParams.get('v')!)}`;
+        }
+    } catch { /* Search terms are handled by the resolver. */ }
     const player = getPlayer(guildId);
-    const first = await resolveFirstTrack(url);
+    let spotifyItems: string[] | undefined;
+    if (/open\.spotify\.com/.test(url)) {
+        try {
+            const tracks = await spotifyTracks(url);
+            for (const track of tracks) trackInfoCache.set(track.url, {
+                title: track.name, author: track.artists.map(artist => artist.name).join(', '),
+                duration: track.durationRaw, thumbnail: track.thumbnail?.url
+            });
+            spotifyItems = tracks.map(track => track.url);
+        } catch (error) {
+            await respond(error instanceof SpotifyError ? `⚠️ ${error.message}` : '⚠️ Spotify lookup failed. Please try again.');
+            return;
+        }
+        if (!spotifyItems.length) {
+            await respond('⚠️ This Spotify playlist contains no available music tracks.');
+            return;
+        }
+    }
+    const first = spotifyItems ? spotifyItems[0] : await resolveFirstTrack(url);
 
     // if fisrt is invalid
     if (!first) {
@@ -228,6 +265,7 @@ export async function processPlayRequest(
             try {
                 await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
             } catch {
+                connection.destroy();
                 await respond('⚠️  Couldn\'t join the voice channel.');
                 return;
             }
@@ -241,11 +279,11 @@ export async function processPlayRequest(
     let q = queues.get(guildId);
     if (!q) { q = []; queues.set(guildId, q); }
 
-    (async () => {
+    if (!spotifyItems) (async () => {
         const rest = await resolveTracks(url);
         if (rest.length && rest[0] === first) rest.shift();
         if (rest.length) q.push(...rest.map(u => ({ url: u, requester })));
-    })();
+    })().catch(error => console.error('Failed to resolve remaining tracks:', error.message));
 
     const existingConn =
         (player as any).subscribers.find((sub: any) => sub.connection?.joinConfig.guildId === guildId)?.connection;
@@ -259,7 +297,13 @@ export async function processPlayRequest(
                 guildId: guildId,
                 adapterCreator: voiceChannel.guild.voiceAdapterCreator
             });
-            await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+            try {
+                await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+            } catch {
+                connection.destroy();
+                await respond('⚠️ Could not connect to Discord voice. Check my Connect and Speak permissions and try again.');
+                return;
+            }
             connection.subscribe(player);
         }
         const resource = await createResource(first);
@@ -288,11 +332,12 @@ export async function processPlayRequest(
             }
         })();
 
+        if (spotifyItems) q.push(...spotifyItems.slice(1).map(url => ({ url, requester })));
         player.play(resource);
-        await respond(`🎶 Now playing: ${first}`);
+        await respond(`🎶 Now playing: ${first}${spotifyItems && spotifyItems.length > 1 ? ` — ${spotifyItems.length - 1} more track(s) queued.` : ''}`);
     } else {
-        q.push({ url: first, requester });
-        await respond('📥 Added to queue.');
+        q.push(...(spotifyItems || [first]).map(url => ({ url, requester })));
+        await respond(`📥 Added ${spotifyItems?.length || 1} track(s) to queue.`);
     }
 }
 
@@ -328,9 +373,8 @@ async function resolveFirstTrack(url: string): Promise<string | null> {
     // YouTube playlist – get first video
     if (/youtube\.com\/.*[?&]list=/.test(url)) {
         try {
-            const pl = await playdl.playlist_info(url, { incomplete: true });
-            const vids = await pl.all_videos();
-            return vids.length ? vids[0].url : null;
+            const result = await runYtDlp(['--flat-playlist', '--playlist-end', '1', '--print', 'webpage_url'], url);
+            return result.split('\n').filter(Boolean)[0] ?? null;
         } catch {
             return null;
         }
@@ -339,23 +383,8 @@ async function resolveFirstTrack(url: string): Promise<string | null> {
     // Single YouTube video
     if (/youtu\.?be|youtube\.com/.test(url)) return url;
 
-    // Spotify
     if (/open\.spotify\.com/.test(url)) {
-        try {
-            const sp: any = await playdl.spotify(url);
-            if (sp.type === 'track') {
-                const sr = await playdl.search(`${sp.name} ${sp.artists[0].name}`, { limit: 1 });
-                return sr.length ? sr[0].url : null;
-            }
-            // playlist / album – just use the first already‑present track blob
-            const firstTrack = sp.tracks?.[0] ?? null;
-            if (firstTrack) {
-                const sr = await playdl.search(`${firstTrack.name} ${firstTrack.artists[0].name}`, { limit: 1 });
-                return sr.length ? sr[0].url : null;
-            }
-        } catch {
-            /* ignore */
-        }
+        return (await spotifyTracks(url))[0]?.url ?? null;
     }
 
     // Fallback – never return raw Spotify links (we can't stream them)
@@ -373,10 +402,8 @@ async function resolveTracks(url: string): Promise<string[]> {
     // any link that contains a "list=" parameter is considered a playlist
     if (/youtube\.com\/.*[?&]list=/.test(url)) {
         try {
-            const pl = await playdl.playlist_info(url, { incomplete: true });
-            // pull every video URL in order
-            const vids = await pl.all_videos();
-            return vids.map(v => v.url);
+            const result = await runYtDlp(['--flat-playlist', '--print', 'webpage_url'], url);
+            return result.split('\n').filter(Boolean);
         } catch (err: any) {
             console.error('YouTube playlist resolve error:', err);
             return [];
@@ -386,31 +413,8 @@ async function resolveTracks(url: string): Promise<string[]> {
     // ─── Single YouTube video ──────────────────────────────────
     if (/youtu\.?be|youtube\.com/.test(url)) return [url];
 
-    // Spotify handling
     if (/open\.spotify\.com/.test(url)) {
-        try {
-            const sp: any = await playdl.spotify(url);
-            // Single track
-            if (sp.type === 'track') {
-                try {
-                const search = await playdl.search(`${sp.name} ${sp.artists[0].name}`, { limit: 1 });
-                    return search.length ? [search[0].url] : [];
-                } catch (err: any) {
-                    console.error('Track search failed, skipping:', sp.name, err);
-                    return [];
-                }
-            }
-            // Playlist / Album
-            if (sp.type === 'playlist' || sp.type === 'album') {
-                // Load the playlist lazily: just queue the raw Spotify URLs.
-                // They will be resolved to YouTube one‑by‑one in createResource().
-                const all = await sp.all_tracks();
-                return all.map((t: any) => t.url as string).filter(Boolean);
-            }
-        } catch (err: any) {
-            console.error('Spotify resolve error:', err);
-        }
-        return [];
+        return (await spotifyTracks(url)).map(track => track.url);
     }
 
     // Fallback – treat as single generic link (play‑dl will attempt streaming)
@@ -422,8 +426,8 @@ async function createResource(url: string) {
     // Never stream directly from Spotify; instead search YouTube/SoundCloud
     if (/open\.spotify\.com/.test(url)) {
         try {
-            const sp: any = await playdl.spotify(url);
-            const sr = await playdl.search(`${sp.name} ${sp.artists[0].name}`, { limit: 1 });
+            const sp: any = await spotifyInfo(url);
+            const sr = await searchYouTube(`${sp.name} ${sp.artists[0].name}`);
             if (sr.length) {
                 // recursively create a resource from the fallback URL
                 return await createResource(sr[0].url);
@@ -433,11 +437,11 @@ async function createResource(url: string) {
     }
 
     // Validate URL before streaming
-    const validation = await playdl.validate(url);
+    const validation = /^https?:\/\//i.test(url);
     if (!validation) {
         // Not a URL, try searching
         console.log(`[INFO] '${url}' is not a valid URL, searching...`);
-        const searchResult = await playdl.search(url, { limit: 1 });
+        const searchResult = await searchYouTube(url);
         if (searchResult.length > 0) {
              return await createResource(searchResult[0].url);
         } else {
@@ -451,18 +455,7 @@ async function createResource(url: string) {
     console.log(`[INFO] Using yt-dlp for ${url}`);
     try {
         // Get the raw audio URL using yt-dlp
-        let command = `yt-dlp -f bestaudio -g`;
-        
-        if (fs.existsSync('/app/cookies.txt')) {
-            command += ` --cookies "/app/cookies.txt"`;
-        }
-        
-        // Add remote components for challenge solving
-        command += ` --remote-components ejs:github`;
-        command += ` --js-runtimes node "${url}"`;
-
-        const { stdout } = await execAsync(command);
-        const audioUrl = stdout.trim();
+        const audioUrl = await runYtDlp(['-f', 'bestaudio', '-g', '--no-playlist'], url);
         if (!audioUrl) throw new Error('yt-dlp returned empty URL');
         
         return createAudioResource(audioUrl, { inputType: StreamType.Arbitrary });
@@ -873,6 +866,9 @@ client.on(Events.MessageCreate, async message => {
             }
         }
     }
+    else if (message.content === '!shuffle') {
+        if (message.guildId) await message.reply(`🔀 Shuffled ${shuffleQueue(message.guildId)} upcoming tracks.`);
+    }
     else if (message.content === '!queue') {
         const gid = message.guild?.id;
         if (gid) {
@@ -1037,6 +1033,9 @@ client.on(Events.InteractionCreate, async interaction  => {
             }
         }
     }
+    else if (interaction.commandName === 'shuffle') {
+        if (interaction.guildId) await interaction.reply(`🔀 Shuffled ${shuffleQueue(interaction.guildId)} upcoming tracks.`);
+    }
     else if (interaction.commandName === 'queue') {
         // Defer reply to avoid interaction timeout while formatting
         await interaction.deferReply();
@@ -1142,6 +1141,49 @@ export function getQueue(guildId: string) {
     return queues.get(guildId) || [];
 }
 
+const pendingMetadata = new Set<string>();
+const metadataJobs: string[] = [];
+let metadataWorkers = 0;
+function hydrateMetadata(url: string) {
+    if (trackInfoCache.has(url) || pendingMetadata.has(url) || pendingMetadata.size >= 100) return;
+    pendingMetadata.add(url);
+    metadataJobs.push(url);
+    drainMetadata();
+}
+function drainMetadata() {
+    while (metadataWorkers < 3 && metadataJobs.length) {
+        const url = metadataJobs.shift()!;
+        metadataWorkers++;
+        void getCachedTrackInfo(url).finally(() => {
+            pendingMetadata.delete(url);
+            metadataWorkers--;
+            drainMetadata();
+        });
+    }
+}
+export function getQueuePage(guildId: string, offset = 0, limit = 50, search = '') {
+    const all = getQueue(guildId).map((track, index) => {
+        track.id ??= randomUUID();
+        const info = trackInfoCache.get(track.url);
+        return { id: track.id, position: index + 1, url: track.url,
+            title: info?.title || null, author: info?.author || null,
+            thumbnail: info?.thumbnail || null, duration: info?.duration || null,
+            requester: track.requester || null, metadataPending: !info };
+    });
+    const query = search.trim().toLowerCase().slice(0, 200);
+    const filtered = query ? all.filter(track => [track.title, track.author, track.url, track.requester]
+        .some(value => value?.toLowerCase().includes(query))) : all;
+    const page = pageItems(filtered, offset, limit);
+    for (const track of page.tracks) hydrateMetadata(track.url);
+    return { count: all.length, filteredCount: filtered.length, ...page };
+}
+export function shuffleQueue(guildId: string): number {
+    const queue = queues.get(guildId);
+    if (!queue) return 0;
+    shuffleInPlace(queue);
+    return queue.length;
+}
+
 export function pausePlayback(guildId: string): boolean {
     const player = players.get(guildId);
     if (player && player.state.status === AudioPlayerStatus.Playing) {
@@ -1227,7 +1269,7 @@ export async function addToQueue(guildId: string, url: string, requester?: strin
             // If rest contains first track, remove it to avoid duplication
             if (rest.length && rest[0] === first) rest.shift();
             if (rest.length) q.push(...rest.map(u => ({ url: u, requester: requester ?? 'Unknown' })));
-        })();
+        })().catch(error => console.error('Failed to resolve queued playlist:', error.message));
 
         // Start playback if nothing is playing
         const player = getPlayer(guildId);

@@ -9,7 +9,8 @@ import yaml from 'js-yaml';
 import {
     getPlayerState,
     getCurrentTrack,
-    getQueue,
+    getQueuePage,
+    shuffleQueue,
     pausePlayback,
     resumePlayback,
     skipTrack,
@@ -18,17 +19,6 @@ import {
     processPlayRequest,
     client
 } from './bot';
-import playdl from 'play-dl';
-
-interface CachedTrackInfo {
-    title: string;
-    author: string;
-    thumbnail: string;
-    duration: number;
-}
-
-const trackInfoCache = new Map<string, CachedTrackInfo>();
-
 const CLIENT_ID = process.env.CLIENT_ID;
 const CLIENT_SECRET = process.env.CLIENT_SECRET;
 const BOT_TOKEN = process.env.DISCORD_TOKEN;
@@ -103,55 +93,16 @@ app.get<{ guildId: string }>('/api/now-playing/:guildId', (req, res) => {
     res.json(track);
 });
 
-app.get<{ guildId: string }>('/api/queue/:guildId', async (req, res) => {
-    const { guildId } = req.params;
-    const queue = getQueue(guildId);
+app.get<{ guildId: string }>('/api/queue/:guildId', (req, res) => {
+    const offset = Number(req.query.offset ?? 0);
+    const limit = Number(req.query.limit ?? 50);
+    const search = typeof req.query.search === 'string' ? req.query.search : '';
+    res.json(getQueuePage(req.params.guildId, offset, limit, search));
+});
 
-    try {
-        // Use index to track position in queue
-        const formattedQueuePromises = queue.map(async (track, index) => {
-            const trackUrl = typeof track === 'string' ? track : track.url;
-            let info = trackInfoCache.get(trackUrl);
-            if (!info) {
-                try {
-                    const fetched = await playdl.video_info(trackUrl);
-                    const video = fetched.video_details;
-                    info = {
-                        title: video.title || 'Unknown Title',
-                        author: video.channel?.name || 'Unknown Artist',
-                        thumbnail: video.thumbnails[0]?.url || '',
-                        duration: video.durationInSec || 0
-                    };
-                    trackInfoCache.set(trackUrl, info);
-                } catch (err) {
-                    console.error(`Error fetching metadata for ${trackUrl}:`, err);
-                    info = {
-                        title: 'Unknown Title',
-                        author: 'Unknown Artist',
-                        thumbnail: '',
-                        duration: 0
-                    };
-                }
-            }
-
-            return {
-                id: index + 1,
-                ...info,
-                url: trackUrl
-            };
-        });
-
-        // Wait for all metadata to be fetched
-        const formattedQueue = await Promise.all(formattedQueuePromises);
-
-        res.json({
-            count: queue.length,
-            tracks: formattedQueue
-        });
-    } catch (error) {
-        console.error('Error processing queue:', error);
-        res.status(500).json({ error: 'Failed to process queue data' });
-    }
+app.post<{ guildId: string }>('/api/controls/:guildId/shuffle', (req, res) => {
+    const count = shuffleQueue(req.params.guildId);
+    res.json({ success: true, count, message: `Shuffled ${count} upcoming tracks` });
 });
 
 app.post<{ guildId: string }>('/api/controls/:guildId/pause', (req, res) => {
@@ -213,15 +164,17 @@ app.post<{ guildId: string }>('/api/queue/:guildId/add', async (req, res) => {
             return;
         }
 
+        let resultMessage = '';
         await processPlayRequest(
             url,
             voiceChannel,
             guildId,
-            () => Promise.resolve(),
+            message => { resultMessage = message; return Promise.resolve(); },
             requester || member.displayName || member.user.username
         );
 
-        res.status(201).json({ success: true, message: 'Song added to queue', url });
+        const success = !resultMessage.startsWith('⚠️');
+        res.status(success ? 201 : 400).json({ success, message: resultMessage || 'Song added to queue', url });
     } catch (error: any) {
         console.error('Error joining voice or adding song:', error);
         res.status(500).json({ success: false, message: 'Failed to process add request', error: error.message });
